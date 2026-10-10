@@ -1,7 +1,7 @@
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
 import http from "http";
-import { randomUUID } from "node:crypto";
+import { randomUUID, timingSafeEqual } from "node:crypto";
 import { isInitializeRequest } from "@modelcontextprotocol/sdk/types.js";
 import { TokenManager } from "../auth/tokenManager.js";
 import { CalendarRegistry } from "../services/CalendarRegistry.js";
@@ -23,6 +23,28 @@ const SECURITY_HEADERS = {
 
 // Maximum number of concurrent HTTP sessions.
 const MAX_SESSIONS = 128;
+
+/**
+ * Protects the remote MCP endpoint and account administration endpoints.
+ * Set LEGIONNAIRE_MCP_TOKEN (at least 32 characters) in Render's environment.
+ * MCP clients must send: Authorization: Bearer <LEGIONNAIRE_MCP_TOKEN>
+ * Never commit a real token to source control.
+ */
+function hasValidBearerToken(authorization: string | undefined, expectedToken: string): boolean {
+  if (!authorization?.startsWith('Bearer ')) {
+    return false;
+  }
+
+  const suppliedToken = authorization.slice('Bearer '.length);
+  // Limit input size before allocating buffers to compare secrets.
+  if (!suppliedToken || suppliedToken.length > 1024) {
+    return false;
+  }
+
+  const supplied = Buffer.from(suppliedToken, 'utf8');
+  const expected = Buffer.from(expectedToken, 'utf8');
+  return supplied.length === expected.length && timingSafeEqual(supplied, expected);
+}
 
 /**
  * Signals that the request body was empty or not valid JSON, so the caller can
@@ -162,6 +184,12 @@ export class HttpTransportHandler {
     const port = this.config.port || 3000;
     const host = this.config.host || '127.0.0.1';
 
+    // Fail closed: never expose a remote Calendar MCP server without a secret.
+    const mcpToken = process.env.LEGIONNAIRE_MCP_TOKEN;
+    if (!mcpToken || mcpToken.length < 32) {
+      throw new Error('LEGIONNAIRE_MCP_TOKEN is required and must have at least 32 characters');
+    }
+
     // Per-session StreamableHTTP transports, keyed by mcp-session-id.
     const transports = new Map<string, StreamableHTTPServerTransport>();
     const activeSseSessions = new Set<string>();
@@ -179,6 +207,25 @@ export class HttpTransportHandler {
           error: 'Forbidden: Invalid origin',
           message: 'Origin header validation failed'
         }));
+        return;
+      }
+
+      // Enforce a shared Bearer token before all MCP and management actions.
+      // The health probe must stay public for Render. The OAuth callback is
+      // protected separately by the existing single-use PKCE/state validation.
+      // Browser CORS preflight does not include credentials, so it is exempt;
+      // Origin validation above still applies to it.
+      const pathname = req.url?.split('?')[0] ?? '/';
+      const isPublicRoute = req.method === 'GET' &&
+        (pathname === '/health' || pathname === '/oauth2callback');
+      if (!isPublicRoute && req.method !== 'OPTIONS' &&
+          !hasValidBearerToken(req.headers.authorization, mcpToken)) {
+        res.writeHead(401, {
+          'Content-Type': 'application/json',
+          'Cache-Control': 'no-store',
+          'WWW-Authenticate': 'Bearer realm="legionnaire-calendar"'
+        });
+        res.end(JSON.stringify({ error: 'Unauthorized' }));
         return;
       }
 
@@ -203,7 +250,7 @@ export class HttpTransportHandler {
       res.setHeader('Access-Control-Allow-Methods', 'GET, POST, DELETE, OPTIONS');
       res.setHeader(
         'Access-Control-Allow-Headers',
-        'Content-Type, Mcp-Session-Id, Mcp-Protocol-Version, Last-Event-ID'
+        'Authorization, Content-Type, Mcp-Session-Id, Mcp-Protocol-Version, Last-Event-ID'
       );
       res.setHeader('Access-Control-Expose-Headers', 'Mcp-Session-Id');
       
